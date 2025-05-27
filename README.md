@@ -1,4 +1,4 @@
-# This is the first rust build release of rockchip npu, cpu, memory, soc thermal usage meter
+# This is the first rust build release of rockchip npu, cpu, memory, soc thermal usage meter( It is build upon arm 32 bit tested on ev1106g3)
 
 ## Build instruction
 ### Install the arm arm gnu gcc in ubuntu or debian based system
