@@ -27,11 +27,14 @@ cargo build --target=armv7-unknown-linux-musleabihf --release
 This command already optimizes your code
 
 ### Binary location
-#### if inside the rknuptop directory
+#### If inside the rknuptop directory
 ```
 cd target/armv7-unknown-linux-musleabihf/release
 ```
-#### if not inside the rknuptop
+#### If not inside the rknuptop
 ```
 cd ~/{PATH-TO-rknuptop}/rknuptop/target/armv7-unknown-linux-musleabihf/release
 ```
+
+## Working picture
+![Alt text](rknputop.png)

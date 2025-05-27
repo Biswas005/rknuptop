@@ -276,7 +276,7 @@ fn calculate_cpu_usage(prev_stats: &HashMap<String, CpuStats>, curr_stats: &Hash
     let mut cpu_loads = Vec::new();
     
     // Skip the aggregate "cpu" entry and process individual cores
-    for i in 0.. {
+    for i in 0..16 {
         let cpu_name = format!("cpu{}", i);
         if let (Some(prev), Some(curr)) = (prev_stats.get(&cpu_name), curr_stats.get(&cpu_name)) {
             let prev_total = prev.total();
