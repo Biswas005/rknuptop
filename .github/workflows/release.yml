@@ -1,0 +1,35 @@
+name: Build and Release ARMv7 Binary
+
+on:
+  push:
+    branches:
+      - main  # or your default branch
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: armv7-unknown-linux-musleabihf
+          override: true
+
+      - name: Build with cross
+        uses: actions-rs/cargo@v1
+        with:
+          use-cross: true
+          command: build
+          args: --release --target armv7-unknown-linux-musleabihf
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Release v${{ github.run_number }}
+          files: target/armv7-unknown-linux-musleabihf/release/your_binary_name
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
