@@ -6,10 +6,11 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -20,10 +21,9 @@ use crossterm::{
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    symbols,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Axis, BarChart, Block, Borders, Chart, Dataset, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame, Terminal,
 };
 use regex::Regex;
@@ -68,52 +68,94 @@ struct ThermalInfo {
 }
 
 #[derive(Debug, Clone)]
+struct CpuStats {
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
+    steal: u64,
+}
+
+impl CpuStats {
+    fn total(&self) -> u64 {
+        self.user + self.nice + self.system + self.idle + self.iowait + self.irq + self.softirq + self.steal
+    }
+
+    fn active(&self) -> u64 {
+        self.user + self.nice + self.system + self.irq + self.softirq + self.steal
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoadAverage {
+    one_min: f32,
+    five_min: f32,
+    fifteen_min: f32,
+    running_processes: u32,
+    total_processes: u32,
+}
+
+#[derive(Debug, Clone)]
 struct SystemStats {
     npu_loads: Vec<u32>,
     cpu_loads: Vec<f32>,
     memory_percent: f64,
     swap_percent: f64,
     thermals: Vec<ThermalInfo>,
+    kernel_release: String,
     kernel_version: String,
-    lib_version: String,
+    load_average: LoadAverage,
 }
 
-const MAX_SAMPLES: usize = 100;
-
 struct App {
-    npu_history: VecDeque<Vec<u32>>,
-    cpu_history: VecDeque<Vec<f32>>,
     current_stats: SystemStats,
     args: Args,
     last_update: Instant,
+    prev_cpu_stats: HashMap<String, CpuStats>,
 }
 
 impl App {
     fn new(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
-        let current_stats = read_system_stats()?;
+        let prev_cpu_stats = read_cpu_stats_raw();
+        let current_stats = read_system_stats(&prev_cpu_stats)?;
         
         Ok(Self {
-            npu_history: VecDeque::with_capacity(MAX_SAMPLES),
-            cpu_history: VecDeque::with_capacity(MAX_SAMPLES),
             current_stats,
             args,
             last_update: Instant::now(),
+            prev_cpu_stats,
         })
     }
 
     fn update(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.last_update.elapsed() >= Duration::from_secs(1) {
-            self.current_stats = read_system_stats()?;
-            
-            self.npu_history.push_back(self.current_stats.npu_loads.clone());
-            if self.npu_history.len() > MAX_SAMPLES {
-                self.npu_history.pop_front();
-            }
+        if self.last_update.elapsed() >= Duration::from_millis(500) {
+            // Update CPU stats with proper calculation
+            let new_cpu_stats = read_cpu_stats_raw();
+            let cpu_loads = calculate_cpu_usage(&self.prev_cpu_stats, &new_cpu_stats);
+            self.prev_cpu_stats = new_cpu_stats;
 
-            self.cpu_history.push_back(self.current_stats.cpu_loads.clone());
-            if self.cpu_history.len() > MAX_SAMPLES {
-                self.cpu_history.pop_front();
-            }
+            // Read other stats
+            let npu_load_str = read_npu_load()?;
+            let npu_loads = parse_npu_load(&npu_load_str);
+            let (memory_percent, swap_percent) = read_memory_stats();
+            let thermals = read_thermal_info();
+            let kernel_release = read_kernel_release();
+            let kernel_version = read_kernel_version();
+            let load_average = read_load_average();
+
+            self.current_stats = SystemStats {
+                npu_loads,
+                cpu_loads,
+                memory_percent,
+                swap_percent,
+                thermals,
+                kernel_release,
+                kernel_version,
+                load_average,
+            };
 
             self.last_update = Instant::now();
         }
@@ -131,22 +173,52 @@ fn read_npu_load() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-fn read_kernel_version() -> String {
-    match fs::read_to_string("/sys/module/rknpu/version") {
-        Ok(content) => {
-            let parts: Vec<&str> = content.split(':').collect();
-            if parts.len() > 1 {
-                parts[1].trim().to_string()
-            } else {
-                "unknown".to_string()
-            }
-        }
+fn read_kernel_release() -> String {
+    match Command::new("uname").arg("-r").output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
         Err(_) => "unknown".to_string(),
     }
 }
 
-fn read_lib_version() -> String {
-    "unknown".to_string()
+fn read_kernel_version() -> String {
+    match fs::read_to_string("/proc/version") {
+        Ok(content) => content.trim().to_string(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn read_load_average() -> LoadAverage {
+    if let Ok(content) = fs::read_to_string("/proc/loadavg") {
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        if parts.len() >= 5 {
+            let one_min = parts[0].parse().unwrap_or(0.0);
+            let five_min = parts[1].parse().unwrap_or(0.0);
+            let fifteen_min = parts[2].parse().unwrap_or(0.0);
+            
+            if let Some(process_part) = parts.get(3) {
+                let process_parts: Vec<&str> = process_part.split('/').collect();
+                if process_parts.len() == 2 {
+                    let running = process_parts[0].parse().unwrap_or(0);
+                    let total = process_parts[1].parse().unwrap_or(0);
+                    return LoadAverage {
+                        one_min,
+                        five_min,
+                        fifteen_min,
+                        running_processes: running,
+                        total_processes: total,
+                    };
+                }
+            }
+        }
+    }
+    
+    LoadAverage {
+        one_min: 0.0,
+        five_min: 0.0,
+        fifteen_min: 0.0,
+        running_processes: 0,
+        total_processes: 0,
+    }
 }
 
 fn parse_npu_load(txt: &str) -> Vec<u32> {
@@ -171,29 +243,63 @@ fn parse_npu_load(txt: &str) -> Vec<u32> {
     results
 }
 
-fn read_cpu_stats() -> Vec<f32> {
-    match fs::read_to_string("/proc/stat") {
-        Ok(content) => {
-            let mut cpu_loads = Vec::new();
-            for line in content.lines() {
-                if line.starts_with("cpu") && line != "cpu" {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 5 {
-                        let user: u64 = parts[1].parse().unwrap_or(0);
-                        let nice: u64 = parts[2].parse().unwrap_or(0);
-                        let system: u64 = parts[3].parse().unwrap_or(0);
-                        let idle: u64 = parts[4].parse().unwrap_or(0);
-                        let total = user + nice + system + idle;
-                        let used = user + nice + system;
-                        let usage = if total > 0 { (used as f32 / total as f32) * 100.0 } else { 0.0 };
-                        cpu_loads.push(usage);
-                    }
+fn read_cpu_stats_raw() -> HashMap<String, CpuStats> {
+    let mut cpu_stats = HashMap::new();
+    
+    if let Ok(content) = fs::read_to_string("/proc/stat") {
+        for line in content.lines() {
+            if line.starts_with("cpu") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 8 {
+                    let cpu_name = parts[0].to_string();
+                    let user: u64 = parts[1].parse().unwrap_or(0);
+                    let nice: u64 = parts[2].parse().unwrap_or(0);
+                    let system: u64 = parts[3].parse().unwrap_or(0);
+                    let idle: u64 = parts[4].parse().unwrap_or(0);
+                    let iowait: u64 = parts[5].parse().unwrap_or(0);
+                    let irq: u64 = parts[6].parse().unwrap_or(0);
+                    let softirq: u64 = parts[7].parse().unwrap_or(0);
+                    let steal: u64 = parts.get(8).unwrap_or(&"0").parse().unwrap_or(0);
+                    
+                    cpu_stats.insert(cpu_name, CpuStats {
+                        user, nice, system, idle, iowait, irq, softirq, steal
+                    });
                 }
             }
-            cpu_loads
         }
-        Err(_) => Vec::new(),
     }
+    
+    cpu_stats
+}
+
+fn calculate_cpu_usage(prev_stats: &HashMap<String, CpuStats>, curr_stats: &HashMap<String, CpuStats>) -> Vec<f32> {
+    let mut cpu_loads = Vec::new();
+    
+    // Skip the aggregate "cpu" entry and process individual cores
+    for i in 0.. {
+        let cpu_name = format!("cpu{}", i);
+        if let (Some(prev), Some(curr)) = (prev_stats.get(&cpu_name), curr_stats.get(&cpu_name)) {
+            let prev_total = prev.total();
+            let curr_total = curr.total();
+            let prev_active = prev.active();
+            let curr_active = curr.active();
+            
+            let total_diff = curr_total.saturating_sub(prev_total);
+            let active_diff = curr_active.saturating_sub(prev_active);
+            
+            let usage = if total_diff > 0 {
+                (active_diff as f32 / total_diff as f32) * 100.0
+            } else {
+                0.0
+            };
+            
+            cpu_loads.push(usage.min(100.0).max(0.0));
+        } else {
+            break;
+        }
+    }
+    
+    cpu_loads
 }
 
 fn read_memory_stats() -> (f64, f64) {
@@ -266,14 +372,15 @@ fn read_thermal_info() -> Vec<ThermalInfo> {
     thermals
 }
 
-fn read_system_stats() -> Result<SystemStats, Box<dyn std::error::Error>> {
+fn read_system_stats(prev_cpu_stats: &HashMap<String, CpuStats>) -> Result<SystemStats, Box<dyn std::error::Error>> {
     let npu_load_str = read_npu_load()?;
     let npu_loads = parse_npu_load(&npu_load_str);
-    let cpu_loads = read_cpu_stats();
+    let cpu_loads = Vec::new(); // Will be calculated in update()
     let (memory_percent, swap_percent) = read_memory_stats();
     let thermals = read_thermal_info();
+    let kernel_release = read_kernel_release();
     let kernel_version = read_kernel_version();
-    let lib_version = read_lib_version();
+    let load_average = read_load_average();
 
     Ok(SystemStats {
         npu_loads,
@@ -281,8 +388,9 @@ fn read_system_stats() -> Result<SystemStats, Box<dyn std::error::Error>> {
         memory_percent,
         swap_percent,
         thermals,
+        kernel_release,
         kernel_version,
-        lib_version,
+        load_average,
     })
 }
 
@@ -296,173 +404,175 @@ fn ui(f: &mut Frame, app: &App) {
 
 fn render_npu_only(f: &mut Frame, app: &App) {
     let size = f.size();
-    
-    if app.args.npu_bars {
-        render_npu_bars(f, size, &app.current_stats.npu_loads);
-    } else {
-        render_npu_chart(f, size, &app.npu_history);
-    }
+    render_npu_htop_style(f, size, &app.current_stats.npu_loads);
 }
 
 fn render_full_dashboard(f: &mut Frame, app: &App) {
     let size = f.size();
+    
+    // Calculate number of lines needed
+    let npu_lines = if app.current_stats.npu_loads.is_empty() { 1 } else { app.current_stats.npu_loads.len() + 2 };
+    let cpu_lines = if app.current_stats.cpu_loads.is_empty() { 1 } else { app.current_stats.cpu_loads.len() + 2 };
+    let memory_lines = 4; // Memory + Swap + borders
+    let thermal_lines = app.current_stats.thermals.len().max(1) + 2;
+    let info_lines = 6; // Load average + kernel info + borders
+    
+    let total_lines = npu_lines + cpu_lines + memory_lines + thermal_lines + info_lines;
+    let available_lines = size.height as usize;
+    
+    // Create flexible layout
+    let mut constraints = Vec::new();
+    if available_lines >= total_lines {
+        constraints.push(Constraint::Length(npu_lines as u16));
+        constraints.push(Constraint::Length(cpu_lines as u16));
+        constraints.push(Constraint::Length(memory_lines as u16));
+        constraints.push(Constraint::Length(thermal_lines as u16));
+        constraints.push(Constraint::Length(info_lines as u16));
+    } else {
+        // If not enough space, use percentages
+        constraints.push(Constraint::Percentage(25)); // NPU
+        constraints.push(Constraint::Percentage(25)); // CPU
+        constraints.push(Constraint::Percentage(20)); // Memory
+        constraints.push(Constraint::Percentage(20)); // Thermals
+        constraints.push(Constraint::Percentage(10)); // Info
+    }
+    
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
-        ])
+        .constraints(constraints)
         .split(size);
 
-    let top_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[0]);
-
-    // NPU
-    if app.args.npu_bars {
-        render_npu_bars(f, top_chunks[0], &app.current_stats.npu_loads);
-    } else {
-        render_npu_chart(f, top_chunks[0], &app.npu_history);
-    }
-
-    // CPU
-    render_cpu_bars(f, top_chunks[1], &app.current_stats.cpu_loads);
-
-    let bottom_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
-
-    // Memory
-    render_memory_gauges(f, bottom_chunks[0], app.current_stats.memory_percent, app.current_stats.swap_percent);
-
-    // Thermals
-    render_thermals(f, bottom_chunks[1], &app.current_stats.thermals);
-
-    // Version info
-    render_version_info(f, chunks[2], &app.current_stats.kernel_version, &app.current_stats.lib_version);
+    // Render each section
+    render_npu_htop_style(f, chunks[0], &app.current_stats.npu_loads);
+    render_cpu_htop_style(f, chunks[1], &app.current_stats.cpu_loads);
+    render_memory_htop_style(f, chunks[2], app.current_stats.memory_percent, app.current_stats.swap_percent);
+    render_thermals_htop_style(f, chunks[3], &app.current_stats.thermals);
+    render_system_info(f, chunks[4], &app.current_stats);
 }
 
-fn render_npu_bars(f: &mut Frame, area: Rect, npu_loads: &[u32]) {
-    let data: Vec<(String, u64)> = npu_loads
-        .iter()
-        .enumerate()
-        .map(|(i, &load)| (format!("C{}", i), load as u64))
-        .collect();
-
-    let data_refs: Vec<(&str, u64)> = data.iter().map(|(s, v)| (s.as_str(), *v)).collect();
-
-    let barchart = BarChart::default()
-        .block(Block::default().title("NPU Load").borders(Borders::ALL))
-        .data(&data_refs)
-        .bar_width(3)
-        .bar_style(Style::default().fg(Color::Yellow))
-        .value_style(Style::default().fg(Color::Black).bg(Color::Yellow));
-
-    f.render_widget(barchart, area);
-}
-
-fn render_npu_chart(f: &mut Frame, area: Rect, npu_history: &VecDeque<Vec<u32>>) {
-    if npu_history.is_empty() {
-        return;
-    }
-
-    let num_cores = npu_history[0].len();
-    let mut all_data: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut datasets = Vec::new();
-
-    for core in 0..num_cores {
-        let data: Vec<(f64, f64)> = npu_history
-            .iter()
-            .enumerate()
-            .map(|(i, loads)| (i as f64, *loads.get(core).unwrap_or(&0) as f64))
-            .collect();
-        all_data.push(data);
-    }
-
-    for (core, data) in all_data.iter().enumerate() {
-        let color = match core {
-            0 => Color::Red,
-            1 => Color::Green,
-            2 => Color::Blue,
-            3 => Color::Yellow,
-            _ => Color::White,
+fn render_npu_htop_style(f: &mut Frame, area: Rect, npu_loads: &[u32]) {
+    let mut items = Vec::new();
+    
+    for (i, &load) in npu_loads.iter().enumerate() {
+        let bar_width = ((area.width - 15) as f32 * (load as f32 / 100.0)) as usize;
+        let bar = "█".repeat(bar_width);
+        let spaces = " ".repeat((area.width - 15) as usize - bar_width);
+        
+        let color = match load {
+            0..=50 => Color::Green,
+            51..=80 => Color::Yellow,
+            _ => Color::Red,
         };
-
-        datasets.push(
-            Dataset::default()
-                .name(format!("Core {}", core))
-                .marker(symbols::Marker::Braille)
-                .style(Style::default().fg(color))
-                .data(data),
-        );
+        
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw(format!("NPU{}: ", i)),
+            Span::styled(format!("{:3}%", load), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw(" ["),
+            Span::styled(bar, Style::default().fg(color)),
+            Span::raw(format!("{}]", spaces)),
+        ])));
+    }
+    
+    if items.is_empty() {
+        items.push(ListItem::new("No NPU data available"));
     }
 
-    let chart = Chart::new(datasets)
-        .block(Block::default().title("NPU Load History").borders(Borders::ALL))
-        .x_axis(Axis::default().title("Time").bounds([0.0, MAX_SAMPLES as f64]))
-        .y_axis(Axis::default().title("Load %").bounds([0.0, 100.0]));
+    let list = List::new(items)
+        .block(Block::default().title("NPU Usage").borders(Borders::ALL));
 
-    f.render_widget(chart, area);
+    f.render_widget(list, area);
 }
 
-fn render_cpu_bars(f: &mut Frame, area: Rect, cpu_loads: &[f32]) {
-    let data: Vec<(String, u64)> = cpu_loads
-        .iter()
-        .enumerate()
-        .map(|(i, &load)| (format!("C{}", i), load as u64))
-        .collect();
+fn render_cpu_htop_style(f: &mut Frame, area: Rect, cpu_loads: &[f32]) {
+    let mut items = Vec::new();
+    
+    for (i, &load) in cpu_loads.iter().enumerate() {
+        let load_int = load.round() as u32;
+        let bar_width = ((area.width - 15) as f32 * (load / 100.0)) as usize;
+        let bar = "█".repeat(bar_width);
+        let spaces = " ".repeat((area.width - 15) as usize - bar_width);
+        
+        let color = match load_int {
+            0..=50 => Color::Green,
+            51..=80 => Color::Yellow,
+            _ => Color::Red,
+        };
+        
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw(format!("CPU{}: ", i)),
+            Span::styled(format!("{:3}%", load_int), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw(" ["),
+            Span::styled(bar, Style::default().fg(color)),
+            Span::raw(format!("{}]", spaces)),
+        ])));
+    }
+    
+    if items.is_empty() {
+        items.push(ListItem::new("CPU data loading..."));
+    }
 
-    let data_refs: Vec<(&str, u64)> = data.iter().map(|(s, v)| (s.as_str(), *v)).collect();
+    let list = List::new(items)
+        .block(Block::default().title("CPU Usage").borders(Borders::ALL));
 
-    let barchart = BarChart::default()
-        .block(Block::default().title("CPU Load").borders(Borders::ALL))
-        .data(&data_refs)
-        .bar_width(2)
-        .bar_style(Style::default().fg(Color::Green))
-        .value_style(Style::default().fg(Color::Black).bg(Color::Green));
-
-    f.render_widget(barchart, area);
+    f.render_widget(list, area);
 }
 
-fn render_memory_gauges(f: &mut Frame, area: Rect, mem_pct: f64, swap_pct: f64) {
+fn render_memory_htop_style(f: &mut Frame, area: Rect, mem_pct: f64, swap_pct: f64) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(Block::default().title("Memory").borders(Borders::ALL).inner(area));
 
+    // Memory bar
     let mem_gauge = Gauge::default()
-        .block(Block::default().title("Memory").borders(Borders::ALL))
-        .gauge_style(Style::default().fg(Color::Blue))
         .percent(mem_pct as u16)
-        .label(format!("{:.1}%", mem_pct));
+        .label(format!("Mem: {:.1}%", mem_pct))
+        .gauge_style(Style::default().fg(
+            if mem_pct > 80.0 { Color::Red } 
+            else if mem_pct > 60.0 { Color::Yellow } 
+            else { Color::Green }
+        ));
 
+    // Swap bar
     let swap_gauge = Gauge::default()
-        .block(Block::default().title("Swap").borders(Borders::ALL))
-        .gauge_style(Style::default().fg(Color::Magenta))
         .percent(swap_pct as u16)
-        .label(format!("{:.1}%", swap_pct));
+        .label(format!("Swp: {:.1}%", swap_pct))
+        .gauge_style(Style::default().fg(
+            if swap_pct > 50.0 { Color::Red } 
+            else if swap_pct > 20.0 { Color::Yellow } 
+            else { Color::Blue }
+        ));
 
-    f.render_widget(mem_gauge, chunks[0]);
-    f.render_widget(swap_gauge, chunks[1]);
+    f.render_widget(
+        Block::default().title("Memory").borders(Borders::ALL),
+        area,
+    );
+    
+    if chunks.len() >= 2 {
+        f.render_widget(mem_gauge, chunks[0]);
+        f.render_widget(swap_gauge, chunks[1]);
+    }
 }
 
-fn render_thermals(f: &mut Frame, area: Rect, thermals: &[ThermalInfo]) {
-    let items: Vec<ListItem> = thermals
-        .iter()
-        .map(|thermal| {
-            let pct = (thermal.current / thermal.high * 100.0) as u16;
-            ListItem::new(Line::from(vec![
-                Span::raw(format!("{}: ", thermal.label)),
-                Span::styled(
-                    format!("{:.1}°C ({}%)", thermal.current, pct),
-                    Style::default().fg(if pct > 80 { Color::Red } else { Color::Green }),
-                ),
-            ]))
-        })
-        .collect();
+fn render_thermals_htop_style(f: &mut Frame, area: Rect, thermals: &[ThermalInfo]) {
+    let mut items = Vec::new();
+    
+    for thermal in thermals {
+        let temp_pct = ((thermal.current / thermal.high) * 100.0) as u16;
+        let color = if temp_pct > 80 { Color::Red } else if temp_pct > 60 { Color::Yellow } else { Color::Green };
+        
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw(format!("{}: ", thermal.label)),
+            Span::styled(
+                format!("{:.1}°C ({:.0}%)", thermal.current, temp_pct),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ])));
+    }
+    
+    if items.is_empty() {
+        items.push(ListItem::new("No thermal sensors found"));
+    }
 
     let list = List::new(items)
         .block(Block::default().title("Thermals").borders(Borders::ALL));
@@ -470,24 +580,34 @@ fn render_thermals(f: &mut Frame, area: Rect, thermals: &[ThermalInfo]) {
     f.render_widget(list, area);
 }
 
-fn render_version_info(f: &mut Frame, area: Rect, kernel_ver: &str, lib_ver: &str) {
+fn render_system_info(f: &mut Frame, area: Rect, stats: &SystemStats) {
     let text = vec![
         Line::from(vec![
-            Span::raw("Kernel: "),
-            Span::styled(kernel_ver, Style::default().fg(Color::Cyan)),
+            Span::raw("Load avg: "),
+            Span::styled(
+                format!("{:.2} {:.2} {:.2}", 
+                    stats.load_average.one_min, 
+                    stats.load_average.five_min, 
+                    stats.load_average.fifteen_min
+                ),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" Tasks: {}/{}", 
+                stats.load_average.running_processes, 
+                stats.load_average.total_processes
+            )),
         ]),
         Line::from(vec![
-            Span::raw("Library: "),
-            Span::styled(lib_ver, Style::default().fg(Color::Cyan)),
+            Span::raw("Kernel: "),
+            Span::styled(&stats.kernel_release, Style::default().fg(Color::Green)),
         ]),
-        Line::from(Span::styled(
-            "Press 'q' to quit",
-            Style::default().fg(Color::Yellow),
-        )),
+        Line::from(vec![
+            Span::styled("Press 'q' to quit", Style::default().fg(Color::Yellow)),
+        ]),
     ];
 
     let paragraph = Paragraph::new(text)
-        .block(Block::default().title("Info").borders(Borders::ALL));
+        .block(Block::default().title("System Info").borders(Borders::ALL));
 
     f.render_widget(paragraph, area);
 }
@@ -497,7 +617,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let initial_load = read_npu_load()?;
     if initial_load.trim().is_empty() {
-        eprintln!("Cannot read anything in /sys/kernel/debug/rknpu/load. Run with `sudo`");
+        eprintln!("Cannot read anything in /proc/rknpu/load. Run with `sudo`");
         std::process::exit(-2);
     }
 
