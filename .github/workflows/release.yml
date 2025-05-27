@@ -3,7 +3,8 @@ name: Build and Release ARMv7 Binary
 on:
   push:
     branches:
-      - main  # or your default branch
+      - main
+  workflow_dispatch:
 
 jobs:
   build-and-release:
