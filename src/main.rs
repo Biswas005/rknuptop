@@ -114,19 +114,19 @@ struct App {
     current_stats: SystemStats,
     args: Args,
     last_update: Instant,
-    prev_cpu_stats: HashMap<String, CpuStats>,
+    _prev_cpu_stats: HashMap<String, CpuStats>,
 }
 
 impl App {
     fn new(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
-        let prev_cpu_stats = read_cpu_stats_raw();
-        let current_stats = read_system_stats(&prev_cpu_stats)?;
+        let _prev_cpu_stats = read_cpu_stats_raw();
+        let current_stats = read_system_stats(&_prev_cpu_stats)?;
         
         Ok(Self {
             current_stats,
             args,
             last_update: Instant::now(),
-            prev_cpu_stats,
+            _prev_cpu_stats,
         })
     }
 
@@ -134,8 +134,8 @@ impl App {
         if self.last_update.elapsed() >= Duration::from_millis(500) {
             // Update CPU stats with proper calculation
             let new_cpu_stats = read_cpu_stats_raw();
-            let cpu_loads = calculate_cpu_usage(&self.prev_cpu_stats, &new_cpu_stats);
-            self.prev_cpu_stats = new_cpu_stats;
+            let cpu_loads = calculate_cpu_usage(&self._prev_cpu_stats, &new_cpu_stats);
+            self._prev_cpu_stats = new_cpu_stats;
 
             // Read other stats
             let npu_load_str = read_npu_load()?;
@@ -372,7 +372,7 @@ fn read_thermal_info() -> Vec<ThermalInfo> {
     thermals
 }
 
-fn read_system_stats(prev_cpu_stats: &HashMap<String, CpuStats>) -> Result<SystemStats, Box<dyn std::error::Error>> {
+fn read_system_stats(_prev_cpu_stats: &HashMap<String, CpuStats>) -> Result<SystemStats, Box<dyn std::error::Error>> {
     let npu_load_str = read_npu_load()?;
     let npu_loads = parse_npu_load(&npu_load_str);
     let cpu_loads = Vec::new(); // Will be calculated in update()
