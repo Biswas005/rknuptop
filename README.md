@@ -5,6 +5,11 @@
 ```
 sudo apt install gcc-arm-linux-gnueabihf
 ```
+### or for fedora
+```
+sudo dnf copr enable lantw44/arm-linux-gnueabihf-toolchain
+sudo dnf install arm-linux-gnueabihf-{binutils,gcc,glibc}
+```
 ### Install rust
 Install full rust toolchain from this website
 https://www.rust-lang.org/tools/install
