@@ -1,4 +1,4 @@
-name: Build and Release ARMv7 Binary
+name: Build and Release Multi-Arch Binaries
 
 on:
   push:
@@ -9,6 +9,14 @@ on:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - armv7-unknown-linux-musleabihf
+          - armv7-unknown-linux-gnueabihf
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+
     steps:
       - uses: actions/checkout@v2
 
@@ -16,7 +24,7 @@ jobs:
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
-          target: armv7-unknown-linux-musleabihf
+          target: ${{ matrix.target }}
           override: true
 
       - name: Build with cross
@@ -24,13 +32,31 @@ jobs:
         with:
           use-cross: true
           command: build
-          args: --release --target armv7-unknown-linux-musleabihf
+          args: --release --target ${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rknputop-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/rknputop
+
+  release:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ github.run_number }}
           name: Release v${{ github.run_number }}
-          files: target/armv7-unknown-linux-musleabihf/release/rknputop
+          files: |
+            artifacts/**/rknputop
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
