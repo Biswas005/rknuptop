@@ -12,6 +12,7 @@ use std::fs;
 use std::io;
 use std::process::Command;
 use std::time::{Duration, Instant};
+use ratatui::widgets::ListState;
 
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -115,29 +116,34 @@ struct App {
     args: Args,
     last_update: Instant,
     _prev_cpu_stats: HashMap<String, CpuStats>,
+    npu_processes: Vec<(u32, String)>,
+    selected_npu_process: Option<usize>,
 }
 
 impl App {
     fn new(args: Args) -> Result<Self, Box<dyn std::error::Error>> {
         let _prev_cpu_stats = read_cpu_stats_raw();
         let current_stats = read_system_stats(&_prev_cpu_stats)?;
-        
+        let npu_processes = get_npu_processes(); // Initial fetch
+
         Ok(Self {
             current_stats,
             args,
             last_update: Instant::now(),
             _prev_cpu_stats,
+            npu_processes,
+            selected_npu_process: None,
         })
     }
 
     fn update(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.last_update.elapsed() >= Duration::from_millis(500) {
-            // Update CPU stats with proper calculation
+            // Update CPU stats
             let new_cpu_stats = read_cpu_stats_raw();
             let cpu_loads = calculate_cpu_usage(&self._prev_cpu_stats, &new_cpu_stats);
             self._prev_cpu_stats = new_cpu_stats;
 
-            // Read other stats
+            // Refresh all stats
             let npu_load_str = read_npu_load()?;
             let npu_loads = parse_npu_load(&npu_load_str);
             let (memory_percent, swap_percent) = read_memory_stats();
@@ -145,6 +151,7 @@ impl App {
             let kernel_release = read_kernel_release();
             let kernel_version = read_kernel_version();
             let load_average = read_load_average();
+            let npu_processes = get_npu_processes(); // Refresh process list
 
             self.current_stats = SystemStats {
                 npu_loads,
@@ -157,11 +164,21 @@ impl App {
                 load_average,
             };
 
+            self.npu_processes = npu_processes;
+
+            // Clamp selection index if needed
+            if let Some(selected) = self.selected_npu_process {
+                if selected >= self.npu_processes.len() {
+                    self.selected_npu_process = None;
+                }
+            }
+
             self.last_update = Instant::now();
         }
         Ok(())
     }
 }
+
 
 fn read_npu_load() -> Result<String, Box<dyn std::error::Error>> {
     match fs::read_to_string("/proc/rknpu/load") {
@@ -409,18 +426,18 @@ fn render_npu_only(f: &mut Frame, app: &App) {
 
 fn render_full_dashboard(f: &mut Frame, app: &App) {
     let size = f.size();
-    
-    // Calculate number of lines needed
+
+    // Calculate line requirements for layout
     let npu_lines = if app.current_stats.npu_loads.is_empty() { 1 } else { app.current_stats.npu_loads.len() + 2 };
     let cpu_lines = if app.current_stats.cpu_loads.is_empty() { 1 } else { app.current_stats.cpu_loads.len() + 2 };
-    let memory_lines = 4; // Memory + Swap + borders
+    let memory_lines = 4;
     let thermal_lines = app.current_stats.thermals.len().max(1) + 2;
-    let info_lines = 6; // Load average + kernel info + borders
-    
-    let total_lines = npu_lines + cpu_lines + memory_lines + thermal_lines + info_lines;
+    let info_lines = 7;
+    let npu_proc_lines = app.npu_processes.len().max(1) + 6; // add buffer
+
+    let total_lines = npu_lines + cpu_lines + memory_lines + thermal_lines + info_lines + npu_proc_lines;
     let available_lines = size.height as usize;
-    
-    // Create flexible layout
+
     let mut constraints = Vec::new();
     if available_lines >= total_lines {
         constraints.push(Constraint::Length(npu_lines as u16));
@@ -428,26 +445,54 @@ fn render_full_dashboard(f: &mut Frame, app: &App) {
         constraints.push(Constraint::Length(memory_lines as u16));
         constraints.push(Constraint::Length(thermal_lines as u16));
         constraints.push(Constraint::Length(info_lines as u16));
+        constraints.push(Constraint::Length(npu_proc_lines as u16));
     } else {
-        // If not enough space, use percentages
-        constraints.push(Constraint::Percentage(25)); // NPU
-        constraints.push(Constraint::Percentage(25)); // CPU
+        // Fit layout to available space
+        constraints.push(Constraint::Percentage(20)); // NPU
+        constraints.push(Constraint::Percentage(20)); // CPU
         constraints.push(Constraint::Percentage(20)); // Memory
-        constraints.push(Constraint::Percentage(20)); // Thermals
-        constraints.push(Constraint::Percentage(10)); // Info
+        constraints.push(Constraint::Percentage(15)); // Thermals
+        constraints.push(Constraint::Percentage(15)); // Info
+        constraints.push(Constraint::Percentage(15)); // NPU PIDs
     }
-    
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(size);
 
-    // Render each section
+    // Render individual dashboard components
     render_npu_htop_style(f, chunks[0], &app.current_stats.npu_loads);
     render_cpu_htop_style(f, chunks[1], &app.current_stats.cpu_loads);
     render_memory_htop_style(f, chunks[2], app.current_stats.memory_percent, app.current_stats.swap_percent);
     render_thermals_htop_style(f, chunks[3], &app.current_stats.thermals);
-    render_system_info(f, chunks[4], &app.current_stats);
+    render_npu_processes(f, chunks[4], &app.npu_processes, app.selected_npu_process);
+    render_system_info(f, chunks[5], &app.current_stats);
+}
+
+fn render_npu_processes(
+    f: &mut Frame,
+    area: Rect,
+    processes: &Vec<(u32, String)>,
+    selected: Option<usize>,
+ ) {
+    let title = "NPU Processes";
+
+    // Create process items
+    let mut items: Vec<ListItem> = processes
+        .iter()
+        .map(|(pid, name)| ListItem::new(format!("{} - {}", pid, name)))
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+        .highlight_symbol(">> ");
+
+    let mut state = ListState::default();
+    state.select(selected);
+
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_npu_htop_style(f: &mut Frame, area: Rect, npu_loads: &[u32]) {
@@ -604,13 +649,44 @@ fn render_system_info(f: &mut Frame, area: Rect, stats: &SystemStats) {
         Line::from(vec![
             Span::styled("Press 'q' to quit", Style::default().fg(Color::Yellow)),
         ]),
+        Line::from(vec![
+            Span::styled("Press '↑ or ↓' to navigate the processes ", Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::styled("Press 'k' to kill process", Style::default().fg(Color::Red)),
+        ]),
     ];
 
     let paragraph = Paragraph::new(text)
         .block(Block::default().title("System Info").borders(Borders::ALL));
-
     f.render_widget(paragraph, area);
 }
+
+fn get_npu_processes() -> Vec<(u32, String)> {
+    let mut npu_procs = Vec::new();
+    let npu_keywords = ["rknn", "rknpu"];
+
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                let maps_path = format!("/proc/{}/maps", pid);
+                let cmdline_path = format!("/proc/{}/cmdline", pid);
+
+                if let Ok(maps) = fs::read_to_string(&maps_path) {
+                    if npu_keywords.iter().any(|kw| maps.contains(kw)) {
+                        let cmdline = fs::read_to_string(&cmdline_path)
+                            .unwrap_or_default()
+                            .replace('\0', " ");
+                        npu_procs.push((pid, cmdline.trim().to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    npu_procs
+}
+
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -658,6 +734,33 @@ fn run_app<B: Backend>(
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                         return Ok(());
+                    }
+                    KeyCode::Up => {
+                        if let Some(i) = app.selected_npu_process {
+                            if i > 0 {
+                                app.selected_npu_process = Some(i - 1);
+                            }
+                        } else if !app.npu_processes.is_empty() {
+                            app.selected_npu_process = Some(0);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(i) = app.selected_npu_process {
+                            if i + 1 < app.npu_processes.len() {
+                                app.selected_npu_process = Some(i + 1);
+                            }
+                        } else if !app.npu_processes.is_empty() {
+                            app.selected_npu_process = Some(0);
+                        }
+                    }
+                    KeyCode::Char('k') => {
+                        if let Some(i) = app.selected_npu_process {
+                            if let Some((pid, _)) = app.npu_processes.get(i) {
+                                use nix::sys::signal::{kill, Signal};
+                                use nix::unistd::Pid;
+                                let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGKILL);
+                            }
+                        }
                     }
                     _ => {}
                 }
