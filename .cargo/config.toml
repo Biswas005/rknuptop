@@ -1,5 +1,5 @@
 [target.armv7-unknown-linux-musleabihf]
-linker = "arm-linux-musleabihf-gcc"
+linker = "arm-linux-gnueabihf-gcc"
 
 [target.armv7-unknown-linux-gnueabihf]
 linker = "arm-linux-gnueabihf-gcc"
@@ -8,4 +8,4 @@ linker = "arm-linux-gnueabihf-gcc"
 linker = "aarch64-linux-gnu-gcc"
 
 [target.aarch64-unknown-linux-musl]
-linker = "aarch64-linux-musl-gcc"
+linker = "aarch64-linux-gnu-gcc"
